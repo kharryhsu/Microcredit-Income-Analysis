@@ -1,0 +1,240 @@
+---
+title: "microcredit_income_analysis"
+output:
+  pdf_document: default
+  html_notebook: default
+date: "2025-10-26"
+---
+
+```{r setup, include=FALSE}
+# Set CRAN mirror
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+# Install missing packages if needed
+packages <- c("readr", "dplyr", "tidyr", "ggplot2", "MatchIt", "haven", "rstudioapi", "broom", "patchwork", "janitor", "scales")
+
+# Install missing packages and load them
+for (pkg in packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  } else {
+    library(pkg, character.only = TRUE)
+  }
+}
+```
+
+# 1. Load datasets
+```{r}
+roster <- read_csv("dataset/roster98.csv") |> 
+  clean_names()
+s91 <- read_csv("dataset/s9_1.csv") |> 
+  clean_names()
+s92a <- read_csv("dataset/S9_2a.csv") |> 
+  clean_names()
+s75 <- read.csv("dataset/S7_5.csv") |> 
+  clean_names()
+s81 <- read_csv("dataset/s8_1.csv") |> 
+  clean_names()
+s82   <- read_csv("dataset/s8_2.csv") |> 
+  clean_names()
+```
+
+# 2. Replace Inf with NA in all datasets (convert to double first)
+```{r}
+fix_inf <- function(df) {
+  df |>
+    mutate(across(where(is.numeric), as.double)) |>
+    mutate(across(where(is.numeric), ~na_if(.x, Inf)))
+}
+
+s91 <- fix_inf(s91)
+s92a <- fix_inf(s92a)
+s75 <- fix_inf(s75)
+s81 <- fix_inf(s81)
+s82 <- fix_inf(s82)
+```
+
+# 3. Quick checks
+```{r}
+# Quick checks
+cat("Rows (roster):", nrow(roster), "\n")
+cat("Rows (S9_1):", nrow(s91), "\n")
+cat("Rows (S9_2a):", nrow(s92a), "\n")
+
+glimpse(s91 |> 
+          select(hhcode, s9_1q2, program) |> 
+          slice(1:5))
+glimpse(s92a |> 
+          select(hhcode, s9_2aq8) |> 
+          slice(1:5))
+glimpse(s81 |> 
+          select(hhcode, s8_1q3, s8_1q4) |> 
+          slice(1:5))
+```
+
+# 4. Create treatment variable
+```{r}
+# s9_1q2 == 1 → household joined a microcredit program
+treat <- s91 |>
+  group_by(hhcode) |>
+  summarise(treatment = ifelse(any(s9_1q2 == 1, na.rm = TRUE), 1, 0))
+
+treat
+```
+
+# 5. Total loan amount per household
+```{r}
+loan <- s92a |>
+  group_by(hhcode) |>
+  summarise(loan_amount = sum(s9_2aq8, na.rm = TRUE))
+
+loan
+```
+
+# 6. Construct income
+```{r}
+# Food: s8_1q3 (own production) + s8_1q4 (purchased)
+food <- s81 |>
+  mutate(food_value = coalesce(s8_1q3, 0) + coalesce(s8_1q4, 0)) |>
+  group_by(hhcode) |>
+  summarise(food_total = sum(food_value, na.rm = TRUE))
+
+food
+
+# Non-food: s8_2q3
+nonfood <- s82 |>
+  group_by(hhcode) |>
+  summarise(nonfood_total = sum(s8_2q3, na.rm = TRUE))
+
+nonfood
+
+# Self-employment: s7_5q6
+selfemp <- s75 |>
+  group_by(hhcode) |>
+  summarise(selfemp_income = sum(s7_5q6, na.rm = TRUE))
+
+selfemp
+```
+
+# 7. Combine all income sources
+```{r}
+income <- roster |>
+  select(hhcode, weight) |>
+  left_join(food, by = "hhcode") |>
+  left_join(nonfood, by = "hhcode") |>
+  left_join(selfemp, by = "hhcode") |>
+  mutate(
+    food_total     = replace_na(food_total, 0),
+    nonfood_total  = replace_na(nonfood_total, 0),
+    selfemp_income = replace_na(selfemp_income, 0),
+    total_income   = food_total + nonfood_total + selfemp_income
+  )
+```
+
+# 8. Merge treatment & loan info
+```{r}
+hh <- income |>
+  left_join(treat, by = "hhcode") |>
+  left_join(loan, by = "hhcode") |>
+  mutate(
+    treatment   = replace_na(treatment, 0),
+    loan_amount = replace_na(loan_amount, 0)
+  )
+```
+
+# 9. Summary checks
+```{r}
+summary(hh$total_income)
+table(hh$treatment)
+```
+
+# 10. Descriptive statistics
+```{r}
+desc <- hh |>
+  group_by(treatment) |>
+  summarise(
+    n = n(),
+    mean_income   = mean(total_income, na.rm = TRUE),
+    sd_income     = sd(total_income, na.rm = TRUE),
+    median_income = median(total_income, na.rm = TRUE)
+  )
+
+desc
+```
+
+# 11. t-test
+```{r}
+t_res <- t.test(total_income ~ treatment, data = hh)
+t_res
+tidy(t_res)
+```
+
+# 12. Correlation: loan amount vs income
+```{r}
+cor_data <- hh |> filter(loan_amount > 0)
+cor_val <- cor(cor_data$loan_amount, cor_data$total_income, use = "complete.obs")
+cat("Correlation between loan amount and income:", round(cor_val, 3), "\n")
+```
+
+# 13. Visualizations
+```{r}
+# Boxplot: income by treatment
+boxplot_income <- ggplot(hh, aes(x = factor(treatment), y = total_income)) +
+  geom_boxplot(outlier.alpha = 0.3, fill = "skyblue") +
+  scale_y_continuous(labels = comma) +          # ✅ show normal numbers
+  labs(
+    x = "Access to Microcredit (1 = Yes)",
+    y = "Household Income (Taka)",
+    title = "Household Income by Microcredit Access"
+  ) +
+  coord_flip()
+
+boxplot_income
+
+ggsave("boxplot_income.png", boxplot_income, width = 6, height = 4, dpi = 300)
+
+# Scatterplot: loan amount vs income
+scatter_income <- ggplot(hh |> filter(loan_amount > 0),
+       aes(x = loan_amount, y = total_income)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  scale_x_continuous(labels = comma) +           # ✅ show normal numbers
+  scale_y_continuous(labels = comma) +           # ✅ show normal numbers
+  labs(
+    x = "Loan Amount (Taka)",
+    y = "Household Income (Taka)",
+    title = "Relationship between Loan Amount and Income"
+  )
+
+scatter_income
+
+ggsave("scatter_income.png", scatter_income, width = 6, height = 4, dpi = 300)
+
+
+# Bar chart: average income by program
+avg_prog <- s91 |>
+  group_by(program) |>
+  summarise(
+    avg_income = mean(hh$total_income[match(hhcode, hh$hhcode)], na.rm = TRUE),
+    n = n()
+  )
+
+bar_income <- ggplot(avg_prog, aes(x = factor(program), y = avg_income)) +
+  geom_col(fill = "lightgreen") +
+  scale_y_continuous(labels = comma) +           # ✅ show normal numbers
+  labs(
+    x = "Program",
+    y = "Average Household Income (Taka)",
+    title = "Average Income by Microcredit Program"
+  )
+
+bar_income
+
+ggsave("bar_income.png", bar_income, width = 6, height = 4, dpi = 300)
+```
+
+# 14. Save outputs
+```{r}
+write_csv(hh, "merged_microcredit_income.csv")
+```
